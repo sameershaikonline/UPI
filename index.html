@@ -32,6 +32,8 @@
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    html { scroll-behavior: smooth; }
+
     body {
       font-family: 'Inter', sans-serif;
       background: linear-gradient(135deg, var(--bg) 0%, var(--bg2) 50%, var(--bg3) 100%);
@@ -268,6 +270,7 @@
     .right-col {
       display: flex; flex-direction: column; align-items: center; gap: 18px;
       flex-shrink: 0;
+      scroll-margin-top: 24px;
     }
 
     .preview-label {
@@ -513,7 +516,7 @@
   </div><!-- /left-col -->
 
   <!-- Right col: Phone -->
-  <div class="right-col">
+  <div class="right-col" id="screenshot">
     <span class="preview-label">Live Preview</span>
 
     <div class="phone" id="phone-frame">
@@ -609,33 +612,23 @@
 
 </div><!-- /main -->
 
-<!-- ── Scripts: CDN primary + local fallback ── -->
+<!-- ── Scripts: Local primary + CDN fallback ── -->
+<script src="jsQR.min.js"></script>
 <script>
-  /* Load jsQR — try CDN first, fall back to local copy */
-  function loadScript(src, fallback, cb) {
+  if (typeof jsQR === 'undefined') {
     const s = document.createElement('script');
-    s.src = src;
-    s.onload = cb;
-    s.onerror = () => {
-      if (fallback) {
-        const s2 = document.createElement('script');
-        s2.src = fallback;
-        s2.onload = cb;
-        s2.onerror = () => { window._libError = (window._libError||'') + src + ' '; };
-        document.head.appendChild(s2);
-      } else {
-        window._libError = (window._libError||'') + src + ' ';
-      }
-    };
+    s.src = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
     document.head.appendChild(s);
   }
 </script>
-<!-- jsQR: jsdelivr → cdnjs → local -->
-<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"
-        onerror="loadScript('https://unpkg.com/jsqr@1.4.0/dist/jsQR.js','jsQR.min.js',null)"></script>
-<!-- html2canvas: cdnjs → local -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"
-        onerror="loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js','html2canvas.min.js',null)"></script>
+<script src="html2canvas.min.js"></script>
+<script>
+  if (typeof html2canvas === 'undefined') {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    document.head.appendChild(s);
+  }
+</script>
 
 <script>
   /* ── Random battery 50–80 ─────────────────────────────────── */
@@ -702,66 +695,120 @@
     return null;
   }
 
-  /* ── Try VPA name lookup via free public APIs ─────────────
-     These endpoints do UPI VPA resolution.
-     We try each in sequence; first success wins.           */
+  /* ── Helper: Timeout signal compatible with all mobile browsers ── */
+  function createTimeoutSignal(ms) {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      try { return AbortSignal.timeout(ms); } catch(_) {}
+    }
+    const c = new AbortController();
+    setTimeout(() => c.abort(), ms);
+    return c.signal;
+  }
+
+  /* ── Try VPA name lookup with fast safe timeout ────────── */
   async function lookupVPAName(vpa) {
-    // Endpoint 1: upivpa.vercel.app (community proxy)
     const endpoints = [
-      `https://upivpa.vercel.app/api?vpa=${encodeURIComponent(vpa)}`,
-      `https://vpa-lookup.vercel.app/api?vpa=${encodeURIComponent(vpa)}`,
+      'https://upivpa.vercel.app/api?vpa=' + encodeURIComponent(vpa),
+      'https://vpa-lookup.vercel.app/api?vpa=' + encodeURIComponent(vpa)
     ];
     for (const url of endpoints) {
       try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        const r = await fetch(url, { signal: createTimeoutSignal(1500) });
         if (!r.ok) continue;
         const j = await r.json();
-        // Different APIs return different shapes
         const name = j.name || j.payee_name || j.vpaName || j.customer_name || j.accountName || '';
         if (name && name.trim() && !isGenericName(name)) return name.trim();
-      } catch(_) { /* timeout or CORS — try next */ }
+      } catch(_) { /* timeout or offline — continue immediately */ }
     }
     return null;
   }
 
-  /* ── Try decode at multiple scales ──────────────────────── */
-  function tryDecode(img) {
+  /* ── Try decode with Mobile-optimized scaling & BarcodeDetector ── */
+  async function tryDecode(img) {
+    // 1. Native hardware vision on Android / modern browsers (ultra-fast 5ms)
+    if ('BarcodeDetector' in window) {
+      try {
+        const detector = new BarcodeDetector({ formats: ['qr_code'] });
+        const barcodes = await detector.detect(img);
+        if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
+          return barcodes[0].rawValue;
+        }
+      } catch(_) {}
+    }
+
     if (typeof jsQR === 'undefined') {
-      throw new Error('jsQR library not loaded. Check your internet connection and reload the page.');
+      throw new Error('QR scanner library is loading. Please try again.');
     }
+
     const canvas = $('qr-canvas');
-    const ctx = canvas.getContext('2d');
-    // Try multiple scales + both color modes for best accuracy
-    const scales = [1, 1.5, 2, 0.75, 0.5, 2.5];
-    for (const sc of scales) {
-      const w = Math.round(img.width  * sc);
-      const h = Math.round(img.height * sc);
-      canvas.width = w; canvas.height = h;
-      ctx.clearRect(0,0,w,h);
-      ctx.drawImage(img, 0, 0, w, h);
-      const data = ctx.getImageData(0,0,w,h);
-      for (const inv of ['dontInvert','invertFirst','attemptBoth']) {
-        const result = jsQR(data.data, w, h, { inversionAttempts: inv });
-        if (result && result.data) return result.data;
-      }
-      // Also try with enhanced contrast
-      const enhanced = ctx.getImageData(0,0,w,h);
-      for (let i=0; i<enhanced.data.length; i+=4) {
-        const avg = (enhanced.data[i]+enhanced.data[i+1]+enhanced.data[i+2])/3;
-        const v   = avg > 128 ? 255 : 0;
-        enhanced.data[i] = enhanced.data[i+1] = enhanced.data[i+2] = v;
-      }
-      for (const inv of ['dontInvert','invertFirst','attemptBoth']) {
-        const result = jsQR(enhanced.data, w, h, { inversionAttempts: inv });
-        if (result && result.data) return result.data;
-      }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const origW = img.naturalWidth || img.width;
+    const origH = img.naturalHeight || img.height;
+
+    if (!origW || !origH) {
+      throw new Error('Could not read image dimensions.');
     }
+
+    // Never blow up canvas on mobile (max dimension constrained)
+    const maxDim = Math.max(origW, origH);
+    const targetScales = [];
+
+    // Pass 1: optimal QR recognition size (~850px)
+    if (maxDim > 850) {
+      targetScales.push(850 / maxDim);
+    } else {
+      targetScales.push(1);
+    }
+
+    // Pass 2: slightly smaller (~550px) for noisy camera shots
+    if (maxDim > 550) {
+      targetScales.push(550 / maxDim);
+    }
+
+    // Pass 3: higher detail (~1100px) if image was large
+    if (maxDim > 1100) {
+      targetScales.push(1100 / maxDim);
+    } else if (!targetScales.includes(1)) {
+      targetScales.push(1);
+    }
+
+    for (const sc of targetScales) {
+      const w = Math.round(origW * sc);
+      const h = Math.round(origH * sc);
+      canvas.width = w;
+      canvas.height = h;
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+
+      const imgData = ctx.getImageData(0, 0, w, h);
+
+      // Fast check standard and inverted
+      for (const inv of ['dontInvert', 'attemptBoth']) {
+        const result = jsQR(imgData.data, w, h, { inversionAttempts: inv });
+        if (result && result.data) return result.data;
+      }
+
+      // Yield to the browser event loop so mobile UI doesn't hang
+      await new Promise(r => setTimeout(r, 10));
+
+      // Quick contrast pass
+      for (let i = 0; i < imgData.data.length; i += 4) {
+        const avg = (imgData.data[i] + imgData.data[i+1] + imgData.data[i+2]) / 3;
+        const v = avg > 128 ? 255 : 0;
+        imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
+      }
+      const contrastResult = jsQR(imgData.data, w, h, { inversionAttempts: 'dontInvert' });
+      if (contrastResult && contrastResult.data) return contrastResult.data;
+
+      await new Promise(r => setTimeout(r, 10));
+    }
+
     return null;
   }
 
-  /* ── QR upload handler ───────────────────────────────────── */
-  function handleQR(e) {
-    const file = e.target.files[0];
+  /* ── QR upload handler with guaranteed non-hanging finally ── */
+  async function handleQR(e) {
+    const file = e.target.files && e.target.files[0];
     if (!file) return;
 
     const statusEl   = $('qr-status');
@@ -770,119 +817,135 @@
     const infoEl     = $('qr-info');
     const thumbEl    = $('qr-thumb');
 
-    // Reset
+    // Reset UI
     statusEl.className   = 'qr-status';
     statusEl.textContent = '';
     resultEl.classList.remove('show');
     scanningEl.classList.add('show');
     scanningEl.querySelector('span').textContent = 'Scanning QR code…';
 
-    const reader = new FileReader();
-    reader.onload = ev => {
-      thumbEl.src = ev.target.result;
+    // Safety timeout: guaranteed to never stay stuck on scanning indefinitely
+    const safetyTimer = setTimeout(() => {
+      scanningEl.classList.remove('show');
+      if (!statusEl.textContent) {
+        statusEl.className   = 'qr-status err';
+        statusEl.textContent = '⚠️ Scanning took too long. Please enter details manually.';
+      }
+    }, 10000);
+
+    let blobUrl = null;
+    try {
+      // Use Object URL for minimal memory usage on mobile devices
+      blobUrl = URL.createObjectURL(file);
+      thumbEl.src = blobUrl;
 
       const img = new Image();
-      img.onload = async () => {
-        // Step 1: decode QR
-        let raw;
-        try {
-          raw = tryDecode(img);
-        } catch(libErr) {
-          scanningEl.classList.remove('show');
-          statusEl.className   = 'qr-status err';
-          statusEl.textContent = `❌ ${libErr.message}`;
-          return;
-        }
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = () => reject(new Error('Failed to load image.'));
+        img.src = blobUrl;
+      });
 
-        if (!raw) {
-          scanningEl.classList.remove('show');
-          statusEl.className   = 'qr-status err';
-          statusEl.textContent = '❌ Could not read QR code. Try a higher-resolution or clearer image.';
-          return;
-        }
+      // Step 1: decode QR
+      const raw = await tryDecode(img);
 
-        const parsed = parseUPI(raw);
-
-        if (!parsed || !parsed.pa) {
-          scanningEl.classList.remove('show');
-          statusEl.className   = 'qr-status err';
-          statusEl.textContent = `⚠️ QR scanned but no UPI data found. Raw: ${raw.substring(0,100)}`;
-          return;
-        }
-
-        // Step 2: determine name
-        let name      = '';
-        let nameSource = '';
-
-        const qrName = parsed.pn ? titleCase(parsed.pn) : '';
-
-        if (qrName && !isGenericName(qrName)) {
-          // QR has a proper merchant name — use it directly
-          name       = qrName;
-          nameSource = 'from QR';
-        } else {
-          // QR name is generic (e.g. "paytm") — try VPA lookup
-          scanningEl.querySelector('span').textContent = 'Looking up merchant name via UPI…';
-
-          const lookedUp = await lookupVPAName(parsed.pa);
-
-          if (lookedUp) {
-            name       = titleCase(lookedUp);
-            nameSource = 'from UPI lookup ✨';
-          } else {
-            // Fallback: use what's in QR or derive from VPA
-            name       = qrName || titleCase(parsed.pa.split('@')[0]);
-            nameSource = 'from QR (enter actual name below)';
-          }
-        }
-
-        scanningEl.classList.remove('show');
-
-        // Fill inputs
-        $('inp-name').value = name;
-        $('inp-upi').value  = parsed.pa;
-
-        // Show result card
-        const nameIsGuess = nameSource.includes('enter actual');
-        infoEl.innerHTML = `
-          <div class="qi-label">Merchant Name <span style="font-size:0.65rem;color:${nameIsGuess?'#fbbf24':'#86efac'}">${nameSource}</span></div>
-          <div class="qi-val" style="${nameIsGuess?'color:#fbbf24':''}">${name}</div>
-          <div class="qi-label" style="margin-top:5px">UPI ID</div>
-          <div class="qi-val">${parsed.pa}</div>
-          ${nameIsGuess ? `<div style="margin-top:8px;font-size:0.72rem;color:#fbbf24;line-height:1.4">
-            ⚠️ The QR stores a generic name (<b>${parsed.pn||'none'}</b>). The actual merchant name<br>
-            (like PhonePe shows) is registered on UPI servers — please type it above.
-          </div>` : ''}
-        `;
-        resultEl.classList.add('show');
-
-        statusEl.className   = 'qr-status ok';
-        statusEl.textContent = nameIsGuess
-          ? `✅ UPI ID found · Please enter the correct merchant name above`
-          : `✅ QR decoded! Name: ${name} · UPI: ${parsed.pa}`;
-
-        // Highlight name field if name is a guess
-        if (nameIsGuess) {
-          const nf = $('inp-name');
-          nf.style.borderColor = '#f59e0b';
-          nf.style.boxShadow   = '0 0 0 3px rgba(245,158,11,0.25)';
-          nf.focus();
-          setTimeout(() => {
-            nf.style.borderColor = '';
-            nf.style.boxShadow   = '';
-          }, 4000);
-        }
-
-        update();
-      };
-      img.onerror = () => {
-        scanningEl.classList.remove('show');
+      if (!raw) {
         statusEl.className   = 'qr-status err';
-        statusEl.textContent = '❌ Failed to load image.';
-      };
-      img.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
+        statusEl.textContent = '❌ Could not read QR code. Try a clearer or higher-contrast photo.';
+        return;
+      }
+
+      const parsed = parseUPI(raw);
+
+      if (!parsed || !parsed.pa) {
+        statusEl.className   = 'qr-status err';
+        statusEl.textContent = '⚠️ QR scanned but no UPI data found: ' + raw.substring(0, 80);
+        return;
+      }
+
+      // Step 2: determine name
+      let name       = '';
+      let nameSource = '';
+      const qrName = parsed.pn ? titleCase(parsed.pn) : '';
+
+      if (qrName && !isGenericName(qrName)) {
+        name       = qrName;
+        nameSource = 'from QR';
+      } else {
+        scanningEl.querySelector('span').textContent = 'Resolving payee name…';
+        const lookedUp = await lookupVPAName(parsed.pa);
+
+        if (lookedUp) {
+          name       = titleCase(lookedUp);
+          nameSource = 'from UPI lookup ✨';
+        } else {
+          // Derive clean name from UPI address (e.g. sameer from sameer@okhdfcbank)
+          const cleanVPA = parsed.pa.split('@')[0].replace(/[._-]/g, ' ');
+          name       = qrName || titleCase(cleanVPA);
+          nameSource = 'from QR (verify name below)';
+        }
+      }
+
+      // Fill inputs
+      $('inp-name').value = name;
+      $('inp-upi').value  = parsed.pa;
+
+      // Show result card
+      const nameIsGuess = nameSource.includes('verify name');
+      infoEl.innerHTML = `
+        <div class="qi-label">Merchant Name <span style="font-size:0.65rem;color:${nameIsGuess ? '#fbbf24' : '#86efac'}">${nameSource}</span></div>
+        <div class="qi-val" style="${nameIsGuess ? 'color:#fbbf24' : ''}">${name}</div>
+        <div class="qi-label" style="margin-top:5px">UPI ID</div>
+        <div class="qi-val">${parsed.pa}</div>
+        ${nameIsGuess ? `<div style="margin-top:8px;font-size:0.72rem;color:#fbbf24;line-height:1.4">
+          ⚠️ The QR stores a generic name (<b>${parsed.pn || 'none'}</b>). Please verify or type the actual name above.
+        </div>` : ''}
+      `;
+      resultEl.classList.add('show');
+
+      statusEl.className   = 'qr-status ok';
+      statusEl.textContent = nameIsGuess
+        ? '✅ UPI ID found · Please verify merchant name above'
+        : '✅ QR decoded! Name: ' + name + ' · UPI: ' + parsed.pa;
+
+      if (nameIsGuess) {
+        const nf = $('inp-name');
+        nf.style.borderColor = '#f59e0b';
+        nf.style.boxShadow   = '0 0 0 3px rgba(245,158,11,0.25)';
+        setTimeout(() => {
+          nf.style.borderColor = '';
+          nf.style.boxShadow   = '';
+        }, 3500);
+      }
+
+      update();
+
+      // Smoothly navigate / scroll down to screenshot preview (#screenshot)
+      setTimeout(() => {
+        try {
+          const target = document.getElementById('screenshot') || document.getElementById('phone-frame');
+          if (target) {
+            if (history.pushState) {
+              history.pushState(null, null, '#screenshot');
+            } else {
+              window.location.hash = 'screenshot';
+            }
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        } catch (_) {}
+      }, 350);
+    } catch (err) {
+      statusEl.className   = 'qr-status err';
+      statusEl.textContent = '❌ ' + (err.message || 'Error scanning QR code.');
+    } finally {
+      clearTimeout(safetyTimer);
+      scanningEl.classList.remove('show');
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+      // Reset input value so re-selecting the same file triggers onchange
+      e.target.value = '';
+    }
   }
 
   /* ── Main preview update ─────────────────────────────────── */
